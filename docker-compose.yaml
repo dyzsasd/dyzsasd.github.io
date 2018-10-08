@@ -1,0 +1,143 @@
+version: '3.2'
+services:
+    deploy:
+        build:
+            context: ./
+            dockerfile: config/images/deploy/Dockerfile
+        container_name: sarasvati-deployment
+
+    redis:
+        image: redis:3.2.6-alpine
+        container_name: redis
+        environment:
+            - REDIS_PASSWORD=sarasvati
+        ports:
+            - "6379:6379"
+        command: redis-server --requirepass sarasvati
+
+    mongodb:
+        image: mongo:3.4.16
+        container_name: "mongodb"
+        environment:
+          - MONGO_DATA_DIR=/data/db
+          - MONGO_LOG_DIR=/dev/null
+          - MONGO_INITDB_DATABASE=dev
+          - MONGO_USERNAME=worker
+          - MONGO_PASSWORD=sarasvati
+          - MONGO_INITDB_ROOT_USERNAME=worker
+          - MONGO_INITDB_ROOT_PASSWORD=sarasvati
+        volumes:
+          - ./data/db:/data/db
+          - ./resources/mongo_init.js:/docker-entrypoint-initdb.d/mongo_init.js
+        ports:
+            - 27017:27017
+
+    pipeline:
+        build:
+            context: ./
+            dockerfile: config/images/sarasvati/Dockerfile
+        depends_on:
+            - redis
+            - mongodb
+        container_name: pipeline
+        command: [
+            "python",
+            "-m",
+            "sarasvati.main",
+            "-w",
+            "sarasvati.workers.pipeline_worker.PipelineProcessWorker"
+        ]
+
+    local_pipeline:
+        build:
+            context: ./
+            dockerfile: config/images/dev/Dockerfile
+        depends_on:
+            - redis
+            - mongodb
+        container_name: local_pipeline
+
+    celery-beat:
+        build:
+            context: ./
+            dockerfile: config/images/sarasvati/Dockerfile
+        depends_on:
+            - redis
+            - mongodb
+            - celery-worker
+        container_name: celery-beat
+        environment:
+            - LAUNCHER=celery
+        command: celery --app=sarasvati.backend beat --loglevel=WARN
+
+    celery-worker:
+        build:
+            context: ./
+            dockerfile: config/images/sarasvati/Dockerfile
+        depends_on:
+            - redis
+            - mongodb
+        container_name: celery-worker
+        environment:
+            - LAUNCHER=celery
+        command: celery --app=sarasvati.backend worker --loglevel=WARN -c 1
+
+    ui:
+        build:
+            context: ./
+            dockerfile: config/images/sarasvati/Dockerfile
+        depends_on:
+            - redis
+            - mongodb
+        command: [
+            "uwsgi",
+            "--http-socket",
+            "0.0.0.0:5000",
+            "--file",
+            "sarasvati/ui/server.wsgi",
+            "--callable",
+            "app",
+            "--master",
+            "--workers",
+            "1",
+            "--close-on-exec",
+            "--enable-threads",
+            "--buffer-size",
+            "32768",
+            "--python-autoreload",
+            "1",
+            "--pidfile",
+            "/tmp/sarasvati-ui.pid"
+        ]
+        ports:
+            - "5000:5000"
+
+    api:
+        build:
+            context: ./
+            dockerfile: config/images/sarasvati/Dockerfile
+        depends_on:
+            - redis
+            - mongodb
+        command: [
+            "uwsgi",
+            "--http-socket",
+            "0.0.0.0:5000",
+            "--file",
+            "sarasvati/api/server.wsgi",
+            "--callable",
+            "app",
+            "--master",
+            "--workers",
+            "1",
+            "--close-on-exec",
+            "--enable-threads",
+            "--buffer-size",
+            "32768",
+            "--python-autoreload",
+            "1",
+            "--pidfile",
+            "/tmp/sarasvati-api.pid"
+        ]
+        ports:
+            - "5000:5000"
