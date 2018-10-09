@@ -43,7 +43,7 @@ class Model():
         saver = tf.train.Saver()
 
         for i in range(epochs):
-            z = np.random.randn(x_train.shape[0], 30)
+            z = np.random.randn(x_train.shape[0], 20)
             for j in range(num_batch_per_epoch):
                 start_index = batch_size * j
                 end_index = start_index + batch_size
@@ -62,7 +62,7 @@ class Model():
                         self.training: True,
                     })
                 if j % 100 == 0:
-                    z_test = np.random.randn(x_test.shape[0], 30)
+                    z_test = np.random.randn(x_test.shape[0], 20)
                     loss_d_val, loss_g_val, summary = sess.run(
                         [self.losses['loss_d'], self.losses['loss_g'], merged],
                         feed_dict={
@@ -90,7 +90,7 @@ class Model():
             x_image = tf.reshape(self.x, [-1, 28, 28, 1], name="x_image")
             self.y_real = tf.placeholder(tf.float32, [None, 10], name='y_real')
 
-            self.z = tf.placeholder(tf.float32, [None, 30], name='z_rand')
+            self.z = tf.placeholder(tf.float32, [None, 20], name='z_rand')
 
             self.dis_real = tf.reshape(
                 tf.ones(tf.slice(tf.shape(x_image), [0], [1]), tf.float32), [-1, 1])
@@ -100,14 +100,14 @@ class Model():
                 tf.ones(tf.slice(tf.shape(self.z), [0], [1]), tf.float32), [-1, 1])
 
         with tf.variable_scope(gen_scope, reuse=reuse):
-            x_fake = self.generate(self.z)
+            x_fake = self.generate(self.z, self.y_real)
 
             self.images_for_tensorboard = self.generate(
-                tf.constant(np.random.randn(10, 30), dtype=tf.float32))
+                tf.constant(np.random.randn(10, 20), dtype=tf.float32), tf.constant(np.eye(10), dtype=tf.float32))
 
         with tf.variable_scope(dis_scope, reuse=reuse):
-            pred_dis_real, dis_logit_real, _ = self.discriminate(x_image)
-            pred_dis_fake, dis_logit_fake, _ = self.discriminate(x_fake)
+            pred_dis_real, dis_logit_real, cat_real, cat_logit_real, _ = self.discriminate(x_image)
+            pred_dis_fake, dis_logit_fake, cat_fake, cat_logit_fake, _ = self.discriminate(x_fake)
 
         reg_variables = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
         reg_term = tf.contrib.layers.apply_regularization(l2_reg, reg_variables)
@@ -118,24 +118,39 @@ class Model():
                     logits=dis_logit_real, labels=self.dis_real),
                 name="loss_d_dis_real"
             )
+
+            loss_d_cat_real = tf.reduce_mean(
+                tf.nn.softmax_cross_entropy_with_logits(
+                    logits=cat_logit_real, labels=self.y_real),
+                name="loss_d_cat_real"
+            )
+
             loss_d_dis_fake = tf.reduce_mean(
                 tf.nn.sigmoid_cross_entropy_with_logits(
                     logits=dis_logit_fake, labels=self.dis_fake),
-                name="loss_d_dis_real"
+                name="loss_d_dis_fake"
             )
 
-            loss_d = loss_d_dis_real + loss_d_dis_fake + reg_term
+            loss_d_cat_fake = tf.reduce_mean(
+                tf.nn.softmax_cross_entropy_with_logits(
+                    logits=cat_logit_fake, labels=self.y_real),
+                name="loss_d_cat_fake"
+            )
+
+            loss_d = loss_d_dis_real + loss_d_dis_fake + loss_d_cat_real# + reg_term
 
             loss_g_dis = tf.reduce_mean(
                 tf.nn.sigmoid_cross_entropy_with_logits(
                     logits=dis_logit_fake, labels=self.dis_fake_inverse),
                 name="loss_g_dis_real"
             )
-            loss_g = loss_g_dis + reg_term
+            loss_g = loss_g_dis + loss_d_cat_fake# + reg_term
 
             self.losses = {
                 "loss_d_dis_real": loss_d_dis_real,
                 "loss_d_dis_fake": loss_d_dis_fake,
+                "loss_d_cat_real": loss_d_cat_real,
+                "loss_d_cat_fake": loss_d_cat_fake,
                 "loss_g_dis": loss_g_dis,
                 "loss_d": loss_d,
                 "loss_g": loss_g,
@@ -166,7 +181,7 @@ class Model():
         with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
             conv = tf.layers.conv2d(
                 inputs=x, filters=filters, kernel_size=kernel_size,
-                strides=strides, padding=padding, name="conv_op"
+                strides=strides, padding=padding, name="conv_op", kernel_regularizer=l2_reg
             )
             activated = activation(conv, name="activated")
             dropout = tf.layers.dropout(inputs=activated, rate=0.4, training=self.training)
@@ -185,7 +200,7 @@ class Model():
     def deconv_with_dropout(self, name, x, filters, kernel_size, strides, padding="same", activation=tf.nn.relu):
         with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
             conv_transpose = tf.layers.conv2d_transpose(
-                x, filters, kernel_size, strides=strides, name="conv_transpose", padding=padding)
+                x, filters, kernel_size, strides=strides, name="conv_transpose", padding=padding, kernel_regularizer=l2_reg)
             activated = activation(conv_transpose,  name="activation")
             dropout = tf.layers.dropout(inputs=activated, rate=0.4, training=self.training)
         return dropout
@@ -199,7 +214,7 @@ class Model():
 
     def dense_with_dropout(self, name, x, output_units, activation):
         with tf.variable_scope(name, reuse=tf.AUTO_REUSE):
-            dense = tf.layers.dense(inputs=x, units=output_units, name="dense")
+            dense = tf.layers.dense(inputs=x, units=output_units, name="dense", kernel_regularizer=l2_reg)
             activated = activation(dense, name="activation")
             dropout = tf.layers.dropout(inputs=activated, rate=0.4, training=self.training)
         return dropout
@@ -211,34 +226,37 @@ class Model():
         The shape of y should be (?, 10)
         """
 
-        conv1 = tf.layers.conv2d(
-            inputs=x, filters=64, kernel_size=[4, 4], strides=2,
-            padding="same", activation=tf.nn.relu, name="conv1", kernel_regularizer=l2_reg
-        )
+        conv1 = self.conv_with_dropout("conv1_with_dropout", x, 64, [4, 4], 1)
+        conv2 = self.conv_with_dropout("conv2_with_dropout", conv1, 64, [4, 4], 2)
+        conv3 = self.conv_with_dropout("conv3_with_dropout", conv2, 128, [4, 4], 1)
+        conv4 = self.conv_with_dropout("conv4_with_dropout", conv3, 128, [4, 4], 2)
 
-        conv1 = self.conv_with_dropout("conv1_with_dropout", x, 128, [4, 4], 2)
-        conv2 = self.conv_with_dropout("conv2_with_dropout", conv1, 128, [4, 4], 2)
+        conv4_flat = tf.reshape(conv4, [-1, 7 * 7 * 128], name="conv4_flat")
+        dropout = self.dense_with_dropout("dense_with_dropout", conv4_flat, 1024, tf.nn.relu)
 
-        conv2_flat = tf.reshape(conv2, [-1, 7 * 7 * 128], name="conv2_flat")
-        dropout = self.dense_with_dropout("dense_with_dropout", conv2_flat, 1024, tf.nn.relu)
-
-        dis_logit = tf.layers.dense(inputs=dropout, units=1, name="dis_logit")
+        dis_logit = tf.layers.dense(inputs=dropout, units=1, name="dis_logit", kernel_regularizer=l2_reg)
         dis = tf.nn.sigmoid(dis_logit)
 
-        return dis, dis_logit, dropout
+        cat_logit = tf.layers.dense(inputs=dropout, units=10, name="cat_logit", kernel_regularizer=l2_reg)
+        cat = tf.nn.softmax(cat_logit)
 
-    def generate(self, z):
+        return dis, dis_logit, cat, cat_logit, dropout
+
+    def generate(self, z, y):
         """Generate images based on random z
         The shape of z should be (?, 10 + <randome dimension>)
         The output shape should be (?, 28, 28, 1)
         """
 
-        dense = self.dense_with_dropout("dense", z, 1024, tf.nn.relu)
+        info = tf.concat([z, y], 1)
+        dense = self.dense_with_dropout("dense", info, 1024, tf.nn.relu)
         flat = self.dense_with_dropout("flat", dense, 7 * 7 * 128, tf.nn.relu)
         reshaped_flat = tf.reshape(flat, [-1, 7, 7, 128], name="reshaped_flat")
         deconv1 = self.deconv_with_dropout("deconv1", reshaped_flat, 64, [4, 4], 2)
+        deconv2 = self.deconv_with_dropout("deconv2", deconv1, 32, [4, 4], 1)
         image = tf.layers.conv2d_transpose(
-            deconv1, 1, [4, 4], strides=2, name="image_logit", padding="same", activation=tf.nn.sigmoid,
+            deconv2, 1, [4, 4], strides=2, name="image_logit", padding="same", activation=tf.nn.sigmoid,
+            kernel_regularizer=l2_reg
         )
 
         return image
@@ -257,5 +275,5 @@ if __name__ == "__main__":
     images_train = mnist.train.images
     labels_train = mnist.train.labels
 
-    model.fit(images_train, labels_train, epochs=10000, batch_size=2)
+    model.fit(images_train, labels_train, epochs=10000, batch_size=128)
 
